@@ -2,12 +2,39 @@ const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
+  demuxProbe,
+  StreamType,
   AudioPlayerStatus,
   NoSubscriberBehavior,
   getVoiceConnection,
 } = require("@discordjs/voice");
 const { PermissionsBitField } = require("discord.js");
 const play = require("play-dl");
+const ytdl = require("ytdl-core");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
+const YTDlpWrap = require("yt-dlp-wrap").default;
+const path = require("path");
+const fs = require("fs");
+
+const ytdlp = new YTDlpWrap();
+let ytdlpReady = false;
+
+async function ensureYtDlp() {
+  if (ytdlpReady) return;
+  try {
+    await ytdlp.getVersion();
+    ytdlpReady = true;
+  } catch {
+    const binDir = path.join(__dirname, "..", "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const binName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
+    const binPath = path.join(binDir, binName);
+    await YTDlpWrap.downloadFromGithub(binPath);
+    ytdlp.setBinaryPath(binPath);
+    ytdlpReady = true;
+  }
+}
 
 const DJ_ROLE = (process.env.DJ_ROLE || "DJ").trim();
 const IDLE_DISCONNECT_MS = 120000;
@@ -46,6 +73,7 @@ function bindPlayerEvents(queue, guildId) {
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
     queues.set(guildId, {
+      guildId,
       textChannelId: null,
       voiceChannelId: null,
       connection: null,
@@ -57,6 +85,7 @@ function getQueue(guildId) {
       idleTimer: null,
       volume: 0.5,
       nowPlaying: null,
+      currentResource: null,
       playerBound: false,
     });
   }
@@ -106,17 +135,90 @@ async function ensureVoice(interaction) {
   return queue;
 }
 
+function isValidUrl(url) {
+  return typeof url === "string" && /^https?:\/\//.test(url);
+}
+
 async function playTrack(queue, track) {
-  if (!track) return;
+  if (!track || !isValidUrl(track.url)) {
+    console.error("Invalid track URL:", track);
+    handleQueueFinish(queue, queue.guildId);
+    return;
+  }
   clearTimeout(queue.idleTimer);
   queue.nowPlaying = track;
 
-  const stream = await play.stream(track.url);
-  const resource = createAudioResource(stream.stream, {
-    inputType: stream.type,
-    inlineVolume: true,
-  });
+  let resource;
+  try {
+    console.log("Streaming URL:", track.url);
+    if (ytdl.validateURL(track.url)) {
+      try {
+        const ytdlStream = ytdl(track.url, {
+          filter: "audioonly",
+          quality: "highestaudio",
+          highWaterMark: 1 << 25,
+        });
+        const probe = await demuxProbe(ytdlStream);
+        resource = createAudioResource(probe.stream, {
+          inputType: probe.type,
+          inlineVolume: true,
+        });
+      } catch (err) {
+        console.error("ytdl-core failed, falling back to yt-dlp:", err);
+        await ensureYtDlp();
+        const direct = await ytdlp.execPromise([
+          "-f",
+          "bestaudio",
+          "-g",
+          track.url,
+        ]);
+        const directUrl = direct.split(/\r?\n/)[0].trim();
+        if (!isValidUrl(directUrl)) {
+          throw new Error("yt-dlp returned invalid URL");
+        }
+        const ffmpeg = spawn(ffmpegPath, [
+          "-reconnect",
+          "1",
+          "-reconnect_streamed",
+          "1",
+          "-reconnect_delay_max",
+          "5",
+          "-i",
+          directUrl,
+          "-analyzeduration",
+          "0",
+          "-loglevel",
+          "0",
+          "-f",
+          "s16le",
+          "-ar",
+          "48000",
+          "-ac",
+          "2",
+          "pipe:1",
+        ]);
+        ffmpeg.on("error", (ffErr) => {
+          console.error("ffmpeg error:", ffErr);
+        });
+        resource = createAudioResource(ffmpeg.stdout, {
+          inputType: StreamType.Raw,
+          inlineVolume: true,
+        });
+      }
+    } else {
+      const stream = await play.stream(track.url);
+      resource = createAudioResource(stream.stream, {
+        inputType: stream.type,
+        inlineVolume: true,
+      });
+    }
+  } catch (err) {
+    console.error("Stream error:", err);
+    handleQueueFinish(queue, queue.guildId);
+    return;
+  }
   resource.volume.setVolume(queue.volume);
+  queue.currentResource = resource;
   queue.player.play(resource);
   queue.playing = true;
 }
@@ -140,4 +242,5 @@ module.exports = {
   scheduleDisconnect,
   hasDjRole,
   DJ_ROLE,
+  isValidUrl,
 };
